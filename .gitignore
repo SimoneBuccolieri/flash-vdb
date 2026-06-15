@@ -1,0 +1,36 @@
+# ── Compiled output ───────────────────────────────────────────
+flash_vdb_test
+*.o
+*.a
+*.so
+*.dylib
+build/
+
+# ── IDE / editor ─────────────────────────────────────────────
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+
+# ── Python (legacy tooling, not part of the C++ library) ─────
+venv/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.egg-info/
+dist/
+*.whl
+
+# ── Model files (large binaries) ─────────────────────────────
+models/
+*.gguf
+*.bin
+*.safetensors
+
+# ── Snapshots produced at runtime ────────────────────────────
+*.vdb
+
+# ── Compiled Python extensions ───────────────────────────────
+lib/
