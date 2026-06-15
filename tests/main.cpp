@@ -1,6 +1,7 @@
 #include "nano_vdb.hpp"
 #include <chrono>
 #include <iostream>
+#include <limits>
 #include <random>
 
 int main() {
@@ -85,12 +86,18 @@ int main() {
   std::cout << "Time elapsed: " << time_graph << " microseconds."
             << std::endl;
 
-  // Calculate speedup multiplier
-  double speedup =
-      static_cast<double>(time_linear) / static_cast<double>(time_graph);
-  std::cout << "\n=== STRATEGIC RESULT ===" << std::endl;
-  std::cout << "Graph Search is " << speedup
-            << " times faster than full linear scanning." << std::endl;
+  // Calculate speedup multiplier (guard against time_graph == 0 with -O3)
+  if (time_graph > 0) {
+    double speedup =
+        static_cast<double>(time_linear) / static_cast<double>(time_graph);
+    std::cout << "\n=== STRATEGIC RESULT ===" << std::endl;
+    std::cout << "Graph Search is " << speedup
+              << "x faster than full linear scanning." << std::endl;
+  } else {
+    std::cout << "\n=== STRATEGIC RESULT ===" << std::endl;
+    std::cout << "Graph Search completed in < 1 µs (unmeasurable at this scale)."
+              << std::endl;
+  }
 
   return 0;
 }

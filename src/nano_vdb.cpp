@@ -1,79 +1,72 @@
 #include "nano_vdb.hpp"
 #include <algorithm>
-#include <arm_neon.h> // Hardware instructions for Apple Silicon (extreme speed)
 #include <cmath>
+#include <cstring>
 #include <fstream>
-#include <stdexcept>
+#include <limits>
 
-// PRIVATE CORE FUNCTION: Calculates Cosine Similarity between two vectors.
-// The closer the score is to 1.0, the more semantically similar the texts are.
-// PRIVATE CORE FUNCTION: Calcola la Cosine Similarity tra il vettore query (float)
-// e il record quantizzato a 8-bit (uint8_t) usando le istruzioni hardware SIMD Neon.
+#ifdef __ARM_NEON
+#include <arm_neon.h>
+#endif
+
+// Calcola la Cosine Similarity tra il vettore query (float32) e il record
+// quantizzato SQ8 (uint8_t), usando la formula algebrica:
+//   dot(Q, D_original) = min_val * sum(Q) + scale * sum(Q_i * q_i)
+// Il path NEON è compilato solo su arm64; altrimenti si usa il fallback scalare.
 float NanoVectorDB::calculate_similarity(const std::vector<float> &query,
                                          float query_norm,
                                          float query_sum,
                                          const VectorRecord &record) const {
-  // --- SPIEGAZIONE MATEMATICA E NEON (SIMD) ---
-  // Invece di dequantizzare l'intero vettore in float (operazione lenta), usiamo la formula:
-  //   dot(Q, D) = sum( Q_i * (min_val + q_i * scale) )
-  //             = min_val * sum(Q_i) + scale * sum(Q_i * q_i)
-  //
-  // Per calcolare sum(Q_i * q_i) in modo ultra-veloce su Apple Silicon, usiamo Neon.
-  // Carichiamo 4 float della query alla volta e convertiamo 4 byte (uint8_t) della query quantizzata in float.
+  float dot_product_q_qdata = 0.0f;
 
+#ifdef __ARM_NEON
+  // ── ARM NEON path (arm64) ───────────────────────────────────────────────
+  // Processa 4 elementi per ciclo usando registri SIMD a 128-bit.
   size_t simd_loops = dimensions / 4;
-  float32x4_t v_dot_product = vdupq_n_f32(0.0f);
-
+  float32x4_t v_acc = vdupq_n_f32(0.0f);
   size_t i = 0;
+
   for (size_t j = 0; j < simd_loops; ++j) {
-    // 1. Carichiamo 4 float della query [Q_i, Q_i+1, Q_i+2, Q_i+3]
+    // Carica 4 float della query in un registro SIMD
     float32x4_t q_vec = vld1q_f32(&query[i]);
 
-    // 2. Carichiamo 4 byte (uint8_t) in modo sicuro ed efficiente per evitare letture fuori dai limiti.
-    // Usiamo memcpy per leggere un uint32_t (che contiene esattamente 4 byte consecutivi).
+    // Legge 4 byte consecutivi di qdata in un uint32_t (memcpy sicuro, no UB)
     uint32_t q_val;
     std::memcpy(&q_val, &record.qdata[i], sizeof(uint32_t));
 
-    // Copiamo questo intero a 32-bit in un registro Neon e lo interpretiamo come 8 byte (uint8x8_t)
-    uint8x8_t d_u8 = vreinterpret_u8_u32(vdup_n_u32(q_val));
-
-    // 3. Estendiamo i 4 byte (uint8_t) a 16-bit (uint16_t)
+    // Interpreta i 4 byte come uint8x8_t, estende a uint16, poi a uint32, poi a float
+    uint8x8_t  d_u8  = vreinterpret_u8_u32(vdup_n_u32(q_val));
     uint16x8_t d_u16 = vmovl_u8(d_u8);
-
-    // 4. Prendiamo la parte bassa ed estendiamo a 32-bit (uint32_t)
     uint32x4_t d_u32 = vmovl_u16(vget_low_u16(d_u16));
-
-    // 5. Convertiamo gli interi a 32-bit in float a 32-bit [q_i, q_i+1, q_i+2, q_i+3]
     float32x4_t d_f32 = vcvtq_f32_u32(d_u32);
 
-    // 6. Moltiplichiamo e accumuliamo: v_dot_product += q_vec * d_f32
-    v_dot_product = vmlaq_f32(v_dot_product, q_vec, d_f32);
-
+    // Accumula: v_acc += q_vec * d_f32
+    v_acc = vmlaq_f32(v_acc, q_vec, d_f32);
     i += 4;
   }
 
-  // Sommiamo i 4 accumulatori parziali del registro Neon in un unico float standard
-  float dot_product_q_qdata = vaddvq_f32(v_dot_product);
+  // Riduce il vettore accumulatore a un singolo float
+  dot_product_q_qdata = vaddvq_f32(v_acc);
 
-  // Gestiamo eventuali dimensioni rimanenti se 'dimensions' non è multiplo di 4
+  // Gestisce i rimanenti elementi se dimensions non è multiplo di 4
   for (; i < dimensions; ++i) {
-    dot_product_q_qdata += query[i] * record.qdata[i];
+    dot_product_q_qdata += query[i] * static_cast<float>(record.qdata[i]);
   }
 
-  // Applichiamo la formula algebrica per ricostruire il dot product finale
+#else
+  // ── Scalar fallback (x86-64 e altri) ────────────────────────────────────
+  for (size_t i = 0; i < dimensions; ++i) {
+    dot_product_q_qdata += query[i] * static_cast<float>(record.qdata[i]);
+  }
+#endif
+
+  // Ricostruisce il dot product effettivo tramite la formula algebrica SQ8
   float dot_product = record.min_val * query_sum + record.scale * dot_product_q_qdata;
 
-  // Calcolo finale Cosine Similarity (dot_product / (||Q|| * ||D||))
   if (query_norm > 0.0f && record.norm > 0.0f) {
     return dot_product / (query_norm * record.norm);
   }
   return 0.0f;
-}
-
-// Funzione helper per ordinare le coppie {index, score}
-bool compare_candidates(const std::pair<size_t, float> &a,
-                        const std::pair<size_t, float> &b) {
-  return a.second > b.second;
 }
 
 // INSERIMENTO SUL GRAFO CON QUANTIZZAZIONE SQ8
@@ -295,62 +288,70 @@ bool NanoVectorDB::save_to_file(const std::string &filename) const {
                 num_neighbors * sizeof(size_t));
     }
   }
-  return true;
+  // Ritorna true solo se tutte le write sono andate a buon fine
+  return out.good();
 }
 
-// Caricamento dei dati quantizzati e dei collegamenti del grafo da disco
+// Caricamento dei dati quantizzati e dei collegamenti del grafo da disco.
+// Usa un vettore di staging locale: il registry viene aggiornato solo se il
+// caricamento completo ha successo, preservando lo stato precedente in caso di errore.
 bool NanoVectorDB::load_from_file(const std::string &filename) {
   std::ifstream in(filename, std::ios::binary);
-  if (!in)
-    return false;
+  if (!in) return false;
 
   size_t file_dims = 0;
   in.read(reinterpret_cast<char *>(&file_dims), sizeof(file_dims));
-  if (file_dims != dimensions)
-    return false;
+  if (in.fail() || file_dims != dimensions) return false;
 
   size_t num_records = 0;
   in.read(reinterpret_cast<char *>(&num_records), sizeof(num_records));
+  if (in.fail()) return false;
 
-  registry.clear();
-  registry.reserve(num_records);
+  // Staging locale: non tocchiamo registry finché il load non è completato
+  std::vector<VectorRecord> staging;
+  staging.reserve(num_records);
 
   for (size_t i = 0; i < num_records; ++i) {
     size_t id_size = 0;
     in.read(reinterpret_cast<char *>(&id_size), sizeof(id_size));
+    if (in.fail()) return false;
 
     std::string id(id_size, '\0');
     in.read(&id[0], id_size);
+    if (in.fail()) return false;
 
-    // Carichiamo qdata (uint8_t)
     std::vector<uint8_t> qdata(dimensions);
     in.read(reinterpret_cast<char *>(qdata.data()), dimensions * sizeof(uint8_t));
+    if (in.fail()) return false;
 
-    // Carichiamo i parametri di dequantizzazione
-    float min_val = 0.0f;
-    float scale = 0.0f;
-    float norm = 0.0f;
+    float min_val = 0.0f, scale = 0.0f, norm = 0.0f;
     in.read(reinterpret_cast<char *>(&min_val), sizeof(min_val));
     in.read(reinterpret_cast<char *>(&scale), sizeof(scale));
     in.read(reinterpret_cast<char *>(&norm), sizeof(norm));
+    if (in.fail()) return false;
 
     size_t num_neighbors = 0;
     in.read(reinterpret_cast<char *>(&num_neighbors), sizeof(num_neighbors));
+    if (in.fail()) return false;
+
     std::vector<size_t> neighbors(num_neighbors);
     if (num_neighbors > 0) {
       in.read(reinterpret_cast<char *>(neighbors.data()),
               num_neighbors * sizeof(size_t));
+      if (in.fail()) return false;
     }
 
-    VectorRecord loaded_record;
-    loaded_record.id = id;
-    loaded_record.qdata = qdata;
-    loaded_record.min_val = min_val;
-    loaded_record.scale = scale;
-    loaded_record.norm = norm;
-    loaded_record.neighbors = neighbors;
-
-    registry.push_back(loaded_record);
+    VectorRecord rec;
+    rec.id        = std::move(id);
+    rec.qdata     = std::move(qdata);
+    rec.min_val   = min_val;
+    rec.scale     = scale;
+    rec.norm      = norm;
+    rec.neighbors = std::move(neighbors);
+    staging.push_back(std::move(rec));
   }
+
+  // Commit atomico: il registry viene sostituito solo a caricamento riuscito
+  registry = std::move(staging);
   return true;
 }
