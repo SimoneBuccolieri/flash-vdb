@@ -1,5 +1,7 @@
 # ── Compiled output ───────────────────────────────────────────
 flash_vdb_test
+flash_server
+flash_client
 *.o
 *.a
 *.so
